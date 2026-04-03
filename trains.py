@@ -1,210 +1,261 @@
-# full_billing_anomaly_pipeline_with_eval.py
-
-import os
+# =========================================
+# 1. IMPORTS
+# =========================================
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+
 from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
-from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+
+from prophet import Prophet
+
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from prophet import Prophet
-import sqlite3
-import joblib
-import matplotlib.pyplot as plt
 
-# ===========================
-# 0. Create OUTMODEL folder
-# ===========================
-MODEL_DIR = "MODEL_DB"
-os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ===========================
-# 1. Load Data
-# ===========================
+# =========================================
+# 2. LOAD DATA
+# =========================================
 df = pd.read_csv("data/raw_dataset.csv")
-df['order_date'] = pd.to_datetime(df['order_date'])
 
-# ===========================
-# 2. Feature Engineering
-# ===========================
+
+# =========================================
+# 3. FEATURE ENGINEERING
+# =========================================
+def feature_engineering(df):
+    df = df.copy()
+
+    # Monetary
+    df["total_amount"] = df["price"] * df["quantity"]
+    df["log_amount"] = np.log1p(df["total_amount"])
+
+    # Customer behavior
+    df["order_count"] = df.groupby("customer_id")["order_id"].transform("count")
+    df["avg_spend_customer"] = df.groupby("customer_id")["total_amount"].transform("mean")
+    df["std_spend_customer"] = df.groupby("customer_id")["total_amount"].transform("std").fillna(0)
+
+    # Time
+    df["order_date"] = pd.to_datetime(df["order_date"])
+    df["day_of_week"] = df["order_date"].dt.dayofweek
+    df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
+
+    # Encode categorical
+    cat_cols = ["payment_method", "country", "city", "category"]
+    encoders = {}
+
+    for col in cat_cols:
+        le = LabelEncoder()
+        df[col] = le.fit_transform(df[col].astype(str))
+        encoders[col] = le
+
+    return df, encoders
+
+
+df, encoders = feature_engineering(df)
+
+
+# =========================================
+# 4. RULE-BASED CHECKS
+# =========================================
+def rule_based_checks(df):
+    df = df.copy()
+
+    # Duplicate
+    df["rule_duplicate"] = df.duplicated(
+        subset=["customer_id", "product_id", "order_date", "total_amount"],
+        keep=False
+    ).astype(int)
+
+    # Price spike vs category
+    category_avg = df.groupby("category")["total_amount"].transform("mean")
+    df["rule_price_spike"] = (df["total_amount"] > 3 * category_avg).astype(int)
+
+    # Quantity anomaly
+    df["rule_quantity"] = (df["quantity"] > df["quantity"].quantile(0.99)).astype(int)
+
+    # Rare payment
+    payment_freq = df["payment_method"].value_counts(normalize=True)
+    df["rule_payment"] = df["payment_method"].map(payment_freq) < 0.02
+    df["rule_payment"] = df["rule_payment"].astype(int)
+
+    # Geo mismatch
+    customer_country = df.groupby("customer_id")["country"].transform(lambda x: x.mode()[0])
+    df["rule_geo"] = (df["country"] != customer_country).astype(int)
+
+    # Known fraud
+    if "is_fraud" in df.columns:
+        df["rule_known_fraud"] = df["is_fraud"].astype(int)
+    else:
+        df["rule_known_fraud"] = 0
+
+    # Weighted rule score
+    weights = {
+        "rule_duplicate": 2,
+        "rule_price_spike": 2,
+        "rule_quantity": 1,
+        "rule_payment": 1,
+        "rule_geo": 1,
+        "rule_known_fraud": 3
+    }
+
+    df["rule_score"] = sum(df[col] * w for col, w in weights.items())
+
+    return df
+
+
+df = rule_based_checks(df)
+
+
+# =========================================
+# 5. FEATURE SELECTION
+# =========================================
 features = [
-    'price', 'quantity', 'total_amount',
-    'user_txn_count', 'user_avg_amount', 'user_max_amount',
-    'user_fraud_rate', 'product_fraud_rate', 'product_avg_price',
-    'country_fraud_rate', 'payment_fraud_rate'
+    "price", "quantity", "total_amount", "log_amount",
+    "order_count", "avg_spend_customer", "std_spend_customer",
+    "day_of_week", "is_weekend",
+    "payment_method", "country", "city", "category"
 ]
-X = df[features].values
+
+X = df[features].copy()
+
+
+# =========================================
+# 6. SCALING
+# =========================================
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# ===========================
-# 3. Autoencoder Model
-# ===========================
+
+# =========================================
+# 7. ISOLATION FOREST
+# =========================================
+iso = IsolationForest(contamination=0.05, random_state=42)
+df["iso_score"] = -iso.fit_predict(X_scaled)
+
+
+# =========================================
+# 8. K-MEANS
+# =========================================
+kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
+clusters = kmeans.fit_predict(X_scaled)
+
+df["cluster"] = clusters
+
+centroids = kmeans.cluster_centers_
+
+df["kmeans_distance"] = [
+    np.linalg.norm(X_scaled[i] - centroids[clusters[i]])
+    for i in range(len(X_scaled))
+]
+
+
+# =========================================
+# 9. PROPHET
+# =========================================
+daily = df.groupby("order_date")["total_amount"].sum().reset_index()
+daily.columns = ["ds", "y"]
+
+model_prophet = Prophet()
+model_prophet.fit(daily)
+
+forecast = model_prophet.predict(daily)
+
+daily["prophet_score"] = np.abs(daily["y"] - forecast["yhat"])
+
+df = df.merge(
+    daily[["ds", "prophet_score"]],
+    left_on="order_date",
+    right_on="ds",
+    how="left"
+).drop(columns=["ds"])
+
+
+# =========================================
+# 10. AUTOENCODER
+# =========================================
 class Autoencoder(nn.Module):
     def __init__(self, input_dim):
-        super(Autoencoder, self).__init__()
+        super().__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 8),
+            nn.Linear(input_dim, 16),
             nn.ReLU(),
-            nn.Linear(8, 4)
+            nn.Linear(16, 8)
         )
         self.decoder = nn.Sequential(
-            nn.Linear(4, 8),
+            nn.Linear(8, 16),
             nn.ReLU(),
-            nn.Linear(8, input_dim)
+            nn.Linear(16, input_dim)
         )
 
     def forward(self, x):
-        z = self.encoder(x)
-        out = self.decoder(z)
-        return out
+        return self.decoder(self.encoder(x))
 
-input_dim = X_scaled.shape[1]
-autoencoder = Autoencoder(input_dim)
+
+X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+
+model_ae = Autoencoder(X_scaled.shape[1])
 criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(autoencoder.parameters(), lr=0.01)
-X_tensor = torch.FloatTensor(X_scaled)
-dataset = TensorDataset(X_tensor)
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+optimizer = torch.optim.Adam(model_ae.parameters(), lr=0.001)
 
-# Training Autoencoder
-epochs = 50
-for epoch in range(epochs):
-    for batch in dataloader:
-        data = batch[0]
-        output = autoencoder(data)
-        loss = criterion(output, data)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    if (epoch+1) % 10 == 0:
-        print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}")
+for epoch in range(50):
+    optimizer.zero_grad()
+    outputs = model_ae(X_tensor)
+    loss = criterion(outputs, X_tensor)
+    loss.backward()
+    optimizer.step()
 
 with torch.no_grad():
-    reconstructed = autoencoder(X_tensor).numpy()
-    ae_scores = np.mean((X_scaled - reconstructed)**2, axis=1)
+    reconstructed = model_ae(X_tensor)
+    errors = torch.mean((X_tensor - reconstructed) ** 2, dim=1)
 
-# ===========================
-# 4. K-Means + Isolation Forest
-# ===========================
-n_clusters = 3
-kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-clusters = kmeans.fit_predict(X_scaled)
+df["autoencoder_score"] = errors.numpy()
 
-if_scores = np.zeros(X_scaled.shape[0])
-isolation_models = {}
-for cluster_id in range(n_clusters):
-    idx = np.where(clusters == cluster_id)[0]
-    X_cluster = X_scaled[idx]
-    iso = IsolationForest(contamination=0.05, random_state=42)
-    iso.fit(X_cluster)
-    if_scores[idx] = -iso.score_samples(X_cluster)
-    isolation_models[cluster_id] = iso
 
-# ===========================
-# 5. Prophet Time-Series per Customer
-# ===========================
-prophet_scores = np.zeros(X_scaled.shape[0])
-for customer_id, group in df.groupby('customer_id'):
-    # Prepare Prophet dataframe
-    ts = group[['order_date', 'total_amount']].rename(columns={'order_date':'ds', 'total_amount':'y'})
-    if len(ts) < 5:
-    	# too few points for Prophet
-        continue
-    model = Prophet(daily_seasonality=True, yearly_seasonality=True)
-    model.fit(ts)
-    forecast = model.predict(ts)
-    residual = np.abs(ts['y'].values - forecast['yhat'].values) / (forecast['yhat'].values + 1e-5)
-    idx = group.index
-    prophet_scores[idx] = residual
+# =========================================
+# 11. NORMALIZATION
+# =========================================
+def normalize(s):
+    return (s - s.min()) / (s.max() - s.min() + 1e-9)
 
-# Normalize Prophet scores
-prophet_scores = prophet_scores / (prophet_scores.max() + 1e-8)
+df["iso_n"] = normalize(df["iso_score"])
+df["kmeans_n"] = normalize(df["kmeans_distance"])
+df["prophet_n"] = normalize(df["prophet_score"])
+df["ae_n"] = normalize(df["autoencoder_score"])
+df["rule_n"] = normalize(df["rule_score"])
 
-# ===========================
-# 6. Rule-Based Checks
-# ===========================
-rule_scores = np.zeros(X_scaled.shape[0])
-rule_scores += (df['total_amount'] > 3 * df['user_avg_amount']).astype(int)
-rule_scores += (df['quantity'] > 10).astype(int)
-rule_scores = np.clip(rule_scores, 0, 1)
 
-# ===========================
-# 7. Weighted Ensemble
-# ===========================
-weights = {
-    'autoencoder': 0.3,
-    'if_kmeans': 0.3,
-    'prophet': 0.2,
-    'rule': 0.2
-}
-
-final_score = (
-    weights['autoencoder'] * (ae_scores / (ae_scores.max() + 1e-8)) +
-    weights['if_kmeans'] * (if_scores / (if_scores.max() + 1e-8)) +
-    weights['prophet'] * prophet_scores +
-    weights['rule'] * rule_scores
+# =========================================
+# 12. FINAL SCORE
+# =========================================
+df["final_score"] = (
+    0.30 * df["iso_n"] +
+    0.20 * df["kmeans_n"] +
+    0.15 * df["prophet_n"] +
+    0.15 * df["ae_n"] +
+    0.20 * df["rule_n"]
 )
 
-confidence = pd.cut(final_score, bins=[0,0.5,0.8,1.0], labels=['Low','Medium','High'])
 
-# ===========================
-# 8. Save Results & Models
-# ===========================
-df['ae_score'] = ae_scores
-df['if_score'] = if_scores
-df['prophet_score'] = prophet_scores
-df['rule_score'] = rule_scores
-df['final_score'] = final_score
-df['confidence'] = confidence
+# =========================================
+# 13. ANOMALY FLAG
+# =========================================
+threshold = df["final_score"].quantile(0.95)
+df["is_anomaly"] = df["final_score"] > threshold
 
-# Save to SQLite
-db_path = os.path.join(MODEL_DIR, "billing_anomaly.db")
-conn = sqlite3.connect(db_path)
-df.to_sql("billing_anomalies", conn, if_exists='replace', index=False)
-conn.close()
-print(f"Data saved to {db_path}")
 
-# Save scaler
-joblib.dump(scaler, os.path.join(MODEL_DIR, "scaler.pkl"))
-print("Scaler saved")
+# =========================================
+# 14. OUTPUT
+# =========================================
+print(df[[
+    "order_id",
+    "final_score",
+    "is_anomaly",
+    "rule_score",
+    "iso_n",
+    "kmeans_n",
+    "prophet_n",
+    "ae_n"
+]].head())
 
-# Save Autoencoder
-torch.save(autoencoder.state_dict(), os.path.join(MODEL_DIR, "autoencoder.pth"))
-print("Autoencoder saved")
-
-# Save KMeans
-joblib.dump(kmeans, os.path.join(MODEL_DIR, "kmeans.pkl"))
-print("KMeans saved")
-
-# Save Isolation Forests per cluster
-for cluster_id, iso_model in isolation_models.items():
-    joblib.dump(iso_model, os.path.join(MODEL_DIR, f"isolation_forest_cluster_{cluster_id}.pkl"))
-print("Isolation Forest models saved")
-print("All models, scaler, and DB saved in MODEL folder.")
-
-# ===========================
-# 9. Evaluation & Visualization
-# ===========================
-def plot_score_distribution(scores, title="Score Distribution"):
-    plt.figure(figsize=(8,4))
-    plt.hist(scores, bins=50, alpha=0.7)
-    plt.title(title)
-    plt.xlabel("Score")
-    plt.ylabel("Frequency")
-    plt.show()
-
-# Plot each method and ensemble
-plot_score_distribution(ae_scores, "Autoencoder Scores")
-plot_score_distribution(if_scores, "Isolation Forest Scores")
-plot_score_distribution(prophet_scores, "Prophet Residuals")
-plot_score_distribution(final_score, "Final Ensemble Scores")
-
-# Optional: print top anomalies
-top_n = 10
-top_anomalies = df.sort_values("final_score", ascending=False).head(top_n)
-print("Top anomalies:")
-print(top_anomalies[['customer_id','order_date','total_amount','final_score','confidence']])
+df.to_csv("anomaly_results.csv", index=False)
