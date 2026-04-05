@@ -4,7 +4,8 @@ from predict import predict
 
 app = FastAPI()
 
-@app.get("/")
+# get api
+@app.get("/")  
 def home():
     return {"message": "Anomaly Detection API is running"}
 
