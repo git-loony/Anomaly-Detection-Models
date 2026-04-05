@@ -1,9 +1,10 @@
 pandas
 numpy
-scikit-learn
+scikit-learn==1.7.2
 torch
 prophet
+gradio
+fastapi
+uvicorn
 joblib
 matplotlib
-pystan
-plotly
