@@ -2,6 +2,7 @@ import pandas as pd
 import joblib
 import torch
 import os
+import sqlite3
 
 from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
@@ -11,7 +12,7 @@ from prophet import Prophet
 from prophet.serialize import model_to_json
 
 
-
+ 
 from trains import feature_engineering, rule_based_checks, Autoencoder, features
 
 os.makedirs("models", exist_ok=True)
@@ -60,5 +61,37 @@ joblib.dump(encoders, "models/encoders.pkl")
 with open("models/prophet.json", "w") as f:
     f.write(model_to_json(prophet_model))
 torch.save(model_ae.state_dict(), "models/ae.pth")
+
+conn = sqlite3.connect("models/models.db")
+cursor = conn.cursor()
+
+# Create table
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS customer_stats (
+    customer_id TEXT PRIMARY KEY,
+    avg_spend REAL,
+    std_spend REAL,
+    order_count INTEGER
+)
+""")
+
+# Insert data
+grouped = df.groupby("customer_id")
+
+for customer_id, group in grouped:
+    avg = float(group["total_amount"].mean())
+    std = float(group["total_amount"].std() or 0)
+    count = int(len(group))
+
+    cursor.execute("""
+    INSERT OR REPLACE INTO customer_stats
+    (customer_id, avg_spend, std_spend, order_count)
+    VALUES (?, ?, ?, ?)
+    """, (str(customer_id), avg, std, count))
+
+conn.commit()
+conn.close()
+
+print("✅ Customer stats saved to SQLite!")
 
 print("✅ Models saved!")
