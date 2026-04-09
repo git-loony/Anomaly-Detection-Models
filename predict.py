@@ -79,7 +79,7 @@ def predict(file):
 
     # Ensemble Scoring
     df["final_score"] = (
-        0.3 * norm(df["iso_score"]) +
+        0.3 * df["iso_score"] +
         0.2 * norm(df["kmeans_distance"]) +
         0.15 * prophet_norm(df["prophet_score"]) + 
         0.15 * norm(df["autoencoder_score"]) +
@@ -92,11 +92,12 @@ def predict(file):
     # Prepare Output
     dff = df[["order_id", "customer_id", "final_score", "is_anomaly"]].copy()
     
-    outlier_score = norm(df["iso_score"]) 
+    outlier_score = df["iso_score"]
     prophet_score = prophet_norm(df["prophet_score"])
     peer_group_score = norm(df["kmeans_distance"])
     novelty_score = norm(df["autoencoder_score"])
-    rule_score = norm(df["rule_score"])
+    rule_score = norm(df["rule_score"]) 
+    
     
     dff["scores"] = [
         {
