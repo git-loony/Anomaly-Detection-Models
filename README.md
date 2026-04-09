@@ -7,7 +7,7 @@ KMeans Clustering
 Autoencoder (PyTorch)
 Hybrid Prophet (per-customer + statistical fallback)
 Rule-based checks
-📌 Features
+📌 Features   
 
 ✅ Multi-model anomaly detection (ensemble)
 ✅ Customer-level behavior modeling
